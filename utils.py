@@ -93,6 +93,74 @@ def cluster_acc(y_pred, y_true):
 
     return w[row_ind, col_ind].sum() / y_pred.size
 
+def split_cluster_acc_v1(y_true, y_pred, mask):
+
+    """
+    Evaluate clustering metrics on two subsets of data, as defined by the mask 'mask'
+    (Mask usually corresponding to `Old' and `New' classes in GCD setting)
+    :param targets: All ground truth labels
+    :param preds: All predictions
+    :param mask: Mask defining two subsets
+    :return:
+    """
+
+    mask = mask.astype(bool)
+    y_true = y_true.astype(int)
+    y_pred = y_pred.astype(int)
+    weight = mask.mean()
+
+    old_acc = cluster_acc(y_true[mask], y_pred[mask])
+    new_acc = cluster_acc(y_true[~mask], y_pred[~mask])
+    total_acc = weight * old_acc + (1 - weight) * new_acc
+
+    return total_acc, old_acc, new_acc
+
+
+def split_cluster_acc_v2(y_true, y_pred, mask):
+    """
+    Calculate clustering accuracy. Require scikit-learn installed
+    First compute linear assignment on all data, then look at how good the accuracy is on subsets
+
+    # Arguments
+        mask: Which instances come from old classes (True) and which ones come from new classes (False)
+        y: true labels, numpy.array with shape `(n_samples,)`
+        y_pred: predicted labels, numpy.array with shape `(n_samples,)`
+
+    # Return
+        accuracy, in [0,1]
+    """
+    y_true = y_true.astype(int)
+
+    old_classes_gt = set(y_true[mask])
+    new_classes_gt = set(y_true[~mask])
+
+    assert y_pred.size == y_true.size
+    D = max(y_pred.max(), y_true.max()) + 1
+    w = np.zeros((D, D), dtype=int)
+    for i in range(y_pred.size):
+        w[y_pred[i], y_true[i]] += 1
+
+    ind = linear_sum_assignment(w.max() - w)
+    ind = np.vstack(ind).T
+
+    ind_map = {j: i for i, j in ind}
+    total_acc = sum([w[i, j] for i, j in ind]) * 1.0 / y_pred.size
+
+    old_acc = 0
+    total_old_instances = 0
+    for i in old_classes_gt:
+        old_acc += w[ind_map[i], i]
+        total_old_instances += sum(w[:, i])
+    old_acc /= total_old_instances
+
+    new_acc = 0
+    total_new_instances = 0
+    for i in new_classes_gt:
+        new_acc += w[ind_map[i], i]
+        total_new_instances += sum(w[:, i])
+    new_acc /= total_new_instances
+
+    return total_acc, old_acc, new_acc
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -245,4 +313,32 @@ def reknn_graph(dist_matrix, n_nearest_neighbor, mode='harmonic_mean'):
 #                 proto_graph_l[i][j] = 0
 #     return proto_graph_l
 
-
+def get_class_splits(args):
+    # -------------
+    # GET CLASS SPLITS
+    # -------------
+    if args.dataset == 'cifar10':
+        if args.setting == 'default':
+            args.train_classes = range(5)
+            args.unlabeled_classes = range(5, 10)
+        elif args.setting == 'animal_1.0_transportation_0.0_1_1':
+            args.train_classes = [2, 3, 4, 5, 6, 7]
+            args.unlabeled_classes = [0, 1, 8, 9]
+        elif args.setting == 'animal_0.0_transportation_1.0_1_1':
+            args.train_classes = [0, 1, 8, 9]
+            args.unlabeled_classes = [2, 3, 4, 5, 6, 7]
+        elif args.setting == 'animal_0.5_transportation_0.0_1_1':
+            args.train_classes = [0, 1]
+            args.unlabeled_classes = [2, 3, 4, 5, 6, 7, 8, 9]
+        elif args.setting == 'animal_0.5_transportation_0.5_1_1':
+            # same as default
+            args.train_classes = [0, 1, 2, 3, 4]
+            args.unlabeled_classes = [5, 6, 7, 8, 9]
+        else:
+            raise NotImplementedError
+    elif args.dataset == 'cifar100':
+        args.train_classes = range(50)
+    else:
+        raise NotImplementedError
+    
+    return args

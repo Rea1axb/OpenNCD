@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 import dataset.open_world_cifar as datasets
-from utils import cluster_acc, AverageMeter, accuracy, Logger, TransformTwice, setup_seed, proto_graph, graph_cluster, reknn_graph
+from utils import cluster_acc, split_cluster_acc_v1, split_cluster_acc_v2, AverageMeter, accuracy, Logger, TransformTwice, setup_seed, proto_graph, graph_cluster, reknn_graph, get_class_splits
 from sklearn import metrics
 import numpy as np
 import os
@@ -13,6 +13,7 @@ from itertools import cycle
 from models.model import Model
 import time
 from scipy.optimize import linear_sum_assignment
+from tqdm import tqdm
 
 
 
@@ -24,7 +25,7 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
     group_losses = AverageMeter('group_loss', ':.4e')
     proto_losses = AverageMeter('proto_loss', ':.4e')
 
-    for batch_idx, ((x_l, x_l2), y_l) in enumerate(train_label_loader):
+    for batch_idx, ((x_l, x_l2), y_l) in enumerate(tqdm(train_label_loader, desc=f'train epoch {epoch}:')):
         
         ((x_u, x_u2), y_u) = next(unlabel_loader_iter)
         x_l, y_l, x_u, y_u = x_l.to(device), y_l.to(device), x_u.to(device), y_u.to(device)
@@ -54,7 +55,7 @@ def val(args, model, device, train_label_loader, train_unlabel_loader, epoch, n_
     targets_u = []
     unlabel_loader_iter = cycle(train_unlabel_loader)
     with torch.no_grad():
-        for batch_idx, ((x_l, _), y_l) in enumerate(train_label_loader):
+        for batch_idx, ((x_l, _), y_l) in enumerate(tqdm(train_label_loader, desc=f'val epoch {epoch}:')):
             ((x_u, _), y_u) = next(unlabel_loader_iter)
             x_l, y_l, x_u, y_u = x_l.to(device), y_l.to(device), x_u.to(device), y_u.to(device)
             feature_l  = model.encoder(x_l)
@@ -150,14 +151,14 @@ def val(args, model, device, train_label_loader, train_unlabel_loader, epoch, n_
 
         return edge_graph, proto_mask_best, group_mask_new_best, proto_ind, acc_best
 
-def test(args, model, labeled_num, device, test_loader, epoch):
+def test(args, model, train_classes, device, test_loader, epoch):
     model.eval()
     preds = np.array([])
     features = []
     targets = np.array([])
     confs = np.array([])
     with torch.no_grad():
-        for batch_idx, (x, label) in enumerate(test_loader):
+        for batch_idx, (x, label) in enumerate(tqdm(test_loader, desc=f'test epoch {epoch}:')):
             x, label = x.to(device), label.to(device)
             pred, conf, feature = model.pred(x)
 
@@ -172,14 +173,18 @@ def test(args, model, labeled_num, device, test_loader, epoch):
     features = features.cpu().numpy()
 
 
-    known_mask = targets < labeled_num
+    # known_mask = targets < labeled_num
+    known_mask = np.isin(targets, train_classes)
     unknown_mask = ~known_mask
 
-    all_acc = cluster_acc(preds, targets)
-    known_acc = accuracy(preds[known_mask], targets[known_mask])
-    unknown_acc = cluster_acc(preds[unknown_mask], targets[unknown_mask])
+    # all_acc = cluster_acc(preds, targets)
+    # known_acc = accuracy(preds[known_mask], targets[known_mask])
+    # unknown_acc = cluster_acc(preds[unknown_mask], targets[unknown_mask])
+    all_acc_v1, old_acc_v1, new_acc_v1 = split_cluster_acc_v1(targets, preds, known_mask)
+    all_acc_v2, old_acc_v2, new_acc_v2 = split_cluster_acc_v2(targets, preds, known_mask)
 
-    print('Test All ACC {:.4f}, Known ACC {:.4f}, Unknown ACC {:.4f}'.format(all_acc, known_acc, unknown_acc))
+    print('Test v1 All ACC {:.4f}, Old ACC {:.4f}, New ACC {:.4f}'.format(all_acc_v1, old_acc_v1, new_acc_v1))
+    print('Test v2 All ACC {:.4f}, Old ACC {:.4f}, New ACC {:.4f}'.format(all_acc_v2, old_acc_v2, new_acc_v2))
 
 
     
@@ -191,7 +196,7 @@ def main():
     parser.add_argument('--milestones', nargs='+', type=int, default=[90, 120])
     parser.add_argument('--dataset', default='cifar10', help='dataset')
     parser.add_argument('--backbone', default='resnet18', help='backbone setting')
-    parser.add_argument('--labeled_num', default=5, type=int)
+    # parser.add_argument('--labeled_num', default=5, type=int)
     parser.add_argument('--labeled_ratio', default=0.1, type=float)
     parser.add_argument('--seed', type=int, default=2023, help='random seed')
     parser.add_argument('--name', type=str, default='')
@@ -199,7 +204,6 @@ def main():
     parser.add_argument('--epochs', type=int, default=150)
     parser.add_argument('-b', '--batch_size', default=512, type=int, help='batch size')
     parser.add_argument('--lamda', default=1, type=float)
-    parser.add_argument('--gpu', default=0, type=int)
     parser.add_argument('--ldim', default=32, type=int)
     parser.add_argument('--nn', default=3, type=int)
     parser.add_argument('--lamda_graph', default=1, type=float)
@@ -216,11 +220,13 @@ def main():
     parser.add_argument('--group_method', default='spectral', help='[louvain/connected/propagation] if unknown_n_cls')
     parser.add_argument('--unknown_n_cls', action='store_true', help='action if n_classes is unknown')
     parser.add_argument('--save_log', action='store_true', help='action to save output')
+    parser.add_argument('--setting', type=str, default='default', help='dataset setting')
     
     
     args = parser.parse_args()
+    args = get_class_splits(args)
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = '%s' %args.gpu
+    # os.environ["CUDA_VISIBLE_DEVICES"] = '%s' %args.gpu
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Current Device:', device)
 
@@ -231,18 +237,17 @@ def main():
     print(args)
 
 
-    root = '../data'
+    root = './data'
     if args.dataset == 'cifar10':
-        train_label_set = datasets.OPENWORLDCIFAR10(root=root, labeled=True, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar10_train']))
-        train_unlabel_set = datasets.OPENWORLDCIFAR10(root=root, labeled=False, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar10_train']), unlabeled_idxs=train_label_set.unlabeled_idxs)
-        test_set = datasets.OPENWORLDCIFAR10(root=root, labeled=False, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=datasets.dict_transform['cifar10_test'], unlabeled_idxs=train_label_set.unlabeled_idxs)
+        train_label_set = datasets.OPENWORLDCIFAR10(root=root, labeled=True, train_classes=args.train_classes, labeled_ratio=args.labeled_ratio, download=True, train=True, transform=TransformTwice(datasets.dict_transform['cifar10_train']))
+        train_unlabel_set = datasets.OPENWORLDCIFAR10(root=root, labeled=False, train_classes=args.train_classes, labeled_ratio=args.labeled_ratio, download=True, train=True, transform=TransformTwice(datasets.dict_transform['cifar10_train']), unlabeled_idxs=train_label_set.unlabeled_idxs)
+        test_set = datasets.OPENWORLDCIFAR10(root=root, labeled=False, train_classes=args.train_classes, labeled_ratio=args.labeled_ratio, download=True, train=False, transform=datasets.dict_transform['cifar10_test'])
         n_classes = 10
 
     elif args.dataset == 'cifar100':
-        args.labeled_num = 50
-        train_label_set = datasets.OPENWORLDCIFAR100(root=root, labeled=True, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar100_train']))
-        train_unlabel_set = datasets.OPENWORLDCIFAR100(root=root, labeled=False, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar100_train']), unlabeled_idxs=train_label_set.unlabeled_idxs)
-        test_set = datasets.OPENWORLDCIFAR100(root=root, labeled=False, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=datasets.dict_transform['cifar100_test'], unlabeled_idxs=train_label_set.unlabeled_idxs)
+        train_label_set = datasets.OPENWORLDCIFAR100(root=root, labeled=True, train_classes=args.train_classes, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar100_train']))
+        train_unlabel_set = datasets.OPENWORLDCIFAR100(root=root, labeled=False, train_classes=args.train_classes, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar100_train']), unlabeled_idxs=train_label_set.unlabeled_idxs)
+        test_set = datasets.OPENWORLDCIFAR100(root=root, labeled=False, train_classes=args.train_classes, labeled_ratio=args.labeled_ratio, download=True, transform=datasets.dict_transform['cifar100_test'], unlabeled_idxs=train_label_set.unlabeled_idxs)
         args.n_proto = 500
         n_classes = 100
         args.lamda_graph = 0.9
@@ -254,12 +259,12 @@ def main():
 
     if not args.unknown_n_cls:
         args.group_method = 'spectral'
-        fix_epoch = 20
+        args.fix_epoch = 40 # 20
 
 
     if args.save_log:
-        NAME = '{}_lratio0{:d}{}'.format(args.dataset, int(args.labeled_ratio*10), 
-                                           "_"+args.group_method if args.unknown_n_cls else '')
+        NAME = '{}_lratio0{:d}{}_{}'.format(args.dataset, int(args.labeled_ratio*10), 
+                                           "_"+args.group_method if args.unknown_n_cls else '', args.setting)
         args.savedir = args.exp_root + NAME
         if not os.path.exists(args.savedir):
             os.makedirs(args.savedir)
@@ -324,7 +329,7 @@ def main():
 
         
         train(args, model, device, train_label_loader, train_unlabel_loader, optimizer, epoch)
-        test(args, model, args.labeled_num, device, test_loader, epoch)
+        test(args, model, args.train_classes, device, test_loader, epoch)
         
 
         scheduler.step()
